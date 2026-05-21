@@ -1,4 +1,0 @@
-Plaintext
-
-gdal-cin
-libgdal-dev
