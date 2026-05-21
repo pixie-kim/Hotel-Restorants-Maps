@@ -7,7 +7,7 @@ import folium
 from streamlit_folium import st_folium
 
 # ─────────────────────────────────────────────
-# 1. 환경 설정 및 경로 정의
+# 1. 파일 경로 및 기본 환경 설정
 # ─────────────────────────────────────────────
 SHP_PATH  = "N3A_G0100000.shp"
 DATA_FILE = "companies.json"
@@ -15,29 +15,39 @@ DATA_FILE = "companies.json"
 st.set_page_config(page_title="행정구역 업체관리", layout="wide", initial_sidebar_state="collapsed")
 
 # ─────────────────────────────────────────────
-# 2. GIS 데이터 로드 (가장 가볍고 효율적인 원본 로드)
+# 2. GIS 데이터 로드 및 표준 GeoJSON 변환 (메모리 유실 방지)
 # ─────────────────────────────────────────────
-def load_base_map():
+@st.cache_data
+def load_geojson_data():
     if not os.path.exists(SHP_PATH):
-        st.error(f"파일을 찾을 수 없습니다: {SHP_PATH}")
+        st.error(f"SHP 파일을 찾을 수 없습니다: {SHP_PATH}")
         st.stop()
     
-    # 원본 데이터 로드 (인코딩: cp949)
+    # SHP 읽기 및 좌표계 변환 (WGS84 표준 위경도)
     gdf = gpd.read_file(SHP_PATH, encoding="cp949")
-    
-    # 대한민국 표준 위경도 좌표계(WGS84)로 변환
     if gdf.crs is None:
         gdf.crs = "EPSG:5179"
     gdf = gdf.to_crs(epsg=4326)
     
-    return gdf
+    # 공백 제거 및 결측치 처리
+    gdf["NAME"] = gdf["NAME"].astype(str).str.strip()
+    gdf = gdf.dropna(subset=["NAME"])
+    
+    # [핵심] 꼬임 방지를 위해 순수 파이썬 dict(GeoJSON) 형태로 캐싱 전환
+    return json.loads(gdf.to_json())
 
-# 데이터 및 행정구역 이름 리스트 추출
-gdf_regions = load_base_map()
-all_region_names = sorted(gdf_regions["NAME"].dropna().unique().tolist())
+# 지도 데이터 포맷 확보
+geojson_data = load_geojson_data()
+
+# 선택 가능한 행정구역 목록 추출
+all_region_names = sorted(list(set(
+    feature['properties']['NAME'] 
+    for feature in geojson_data['features'] 
+    if feature['properties'].get('NAME')
+)))
 
 # ─────────────────────────────────────────────
-# 3. 사용자 데이터(JSON) 로드 및 상태 관리
+# 3. 사용자 데이터 데이터베이스(JSON) 관리
 # ─────────────────────────────────────────────
 if "region_data" not in st.session_state:
     if os.path.exists(DATA_FILE):
@@ -50,10 +60,10 @@ if "region_data" not in st.session_state:
         st.session_state.region_data = {}
 
 if "selected_region" not in st.session_state or st.session_state.selected_region not in all_region_names:
-    st.session_state.selected_region = all_region_names[0]
+    st.session_state.selected_region = all_region_names[0] if all_region_names else ""
 
 # ─────────────────────────────────────────────
-# 4. 메인 UI 레이아웃
+# 4. 메인 대시보드 화면 레이아웃
 # ─────────────────────────────────────────────
 st.title("🗺️ 대한민국 행정구역 업체관리 시스템")
 
@@ -64,24 +74,21 @@ with tab_map:
 
     with col_map:
         st.markdown("#### 🎯 행정구역 검색 및 선택")
+        
+        # 검색 지원 드롭다운과 동기화
         chosen = st.selectbox(
             "관리할 지역을 선택하세요", 
             all_region_names, 
-            index=all_region_names.index(st.session_state.selected_region)
+            index=all_region_names.index(st.session_state.selected_region) if st.session_state.selected_region in all_region_names else 0
         )
         if chosen != st.session_state.selected_region:
             st.session_state.selected_region = chosen
             st.rerun()
 
-        # 지도 중심점 계산 (전체 데이터 경계면 기준)
-        bounds = gdf_regions.total_bounds
-        m = folium.Map(
-            location=[(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2], 
-            zoom_start=8, 
-            tiles="OpenStreetMap"
-        )
+        # 대한민국 중심부를 기본 축으로 지도 레이아웃 빌드
+        m = folium.Map(location=[36.3, 127.8], zoom_start=8, tiles="OpenStreetMap")
         
-        # 선택된 지역만 분홍색 하이라이트 스타일 정의
+        # 선택 구역 하이라이팅 스타일 함수
         def region_style(feature):
             curr_name = feature['properties'].get('NAME', '')
             is_target = (curr_name == st.session_state.selected_region)
@@ -89,17 +96,18 @@ with tab_map:
                 'fillColor': '#ffb6c1' if is_target else '#4361ee',
                 'color': '#dc325a' if is_target else '#4361ee',
                 'weight': 3 if is_target else 1,
-                'fillOpacity': 0.6 if is_target else 0.1
+                'fillOpacity': 0.6 if is_target else 0.15
             }
 
+        # 정제된 순수 GeoJSON 레이어 주입
         folium.GeoJson(
-            gdf_regions.__geo_interface__,
+            geojson_data,
             style_function=region_style,
             tooltip=folium.GeoJsonTooltip(fields=["NAME"], aliases=["지역명:"])
         ).add_to(m)
         
-        # 지도 컴포넌트 렌더링
-        st_folium(m, width="100%", height=580, key="static_gis_map")
+        # 인터랙티브 맵 렌더링
+        st_folium(m, width="100%", height=580, key="stable_geojson_map")
 
     with col_panel:
         region = st.session_state.selected_region
@@ -110,7 +118,7 @@ with tab_map:
 
         companies = st.session_state.region_data[region]
 
-        # 업체 입력 필드 구성
+        # 데이터 입력 가젯 렌더링 루프
         to_delete = None
         for idx, company in enumerate(companies):
             with st.container():
@@ -118,7 +126,7 @@ with tab_map:
                 c_addr = st.text_input("상세 주소", value=company.get("address", ""), key=f"a_{region}_{idx}")
                 c_phon = st.text_input("전화번호", value=company.get("phone", ""), key=f"p_{region}_{idx}")
                 
-                # 실시간 값 동기화
+                # 입력 상태 배열에 즉시 업데이트 보존
                 st.session_state.region_data[region][idx] = {"name": c_name, "address": c_addr, "phone": c_phon}
                 
                 if st.button("🗑️ 제거", key=f"d_{region}_{idx}", use_container_width=True):
@@ -138,14 +146,15 @@ with tab_map:
                 st.rerun()
         with b2:
             if st.button("💾 최종 저장", type="primary", use_container_width=True):
+                # 유효 데이터 필터링 후 영구 저장
                 st.session_state.region_data[region] = [c for c in companies if c.get("name", "").strip()]
                 with open(DATA_FILE, "w", encoding="utf-8") as f:
                     json.dump(st.session_state.region_data, f, ensure_ascii=False, indent=4)
-                st.success("저장되었습니다.")
+                st.success("데이터베이스에 반영되었습니다.")
                 st.rerun()
 
 # ─────────────────────────────────────────────
-# 5. 데이터 목록 출력 탭
+# 5. 데이터 그리드 및 통합 내보내기 탭
 # ─────────────────────────────────────────────
 with tab_list:
     st.markdown("#### 📋 등록된 전체 업체 데이터베이스")
@@ -165,4 +174,4 @@ with tab_list:
             mime="text/csv"
         )
     else:
-        st.info("등록된 업체가 없습니다.")
+        st.info("현재 등록된 업체 정보가 존재하지 않습니다.")
