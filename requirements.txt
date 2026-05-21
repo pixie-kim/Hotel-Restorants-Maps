@@ -1,4 +1,8 @@
+Plaintext
+
 streamlit
-pillow
 pandas
-streamlit-image-coordinates
+geopandas
+folium
+streamlit-folium
+fiona
